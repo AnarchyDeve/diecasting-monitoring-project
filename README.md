@@ -1,0 +1,159 @@
+# 🏭 본 프로젝트 2 – 다이캐스팅 공정 데이터 기반 운영·관리·분석·모니터링 대시보드
+
+**Demo:** [https://yeonduhaeyo.shinyapps.io/diecasting-monitoring2/](https://yeonduhaeyo.shinyapps.io/diecasting-monitoring2/)
+
+---
+
+## 📌 목차
+
+1. [프로젝트 개요](#-프로젝트-개요)
+2. [주요 데이터 컬럼](#-주요-데이터-컬럼)
+3. [데이터 분석·전처리](#-데이터-분석전처리)
+4. [모델링·품질관리 로직](#-모델링품질관리-로직)
+5. [대시보드 기능(역할별)](#-대시보드-기능역할별)
+6. [사용 기술](#-사용-기술)
+7. [프로젝트 구조](#-프로젝트-구조)
+8. [결론 및 운영 가이드](#-결론-및-운영-가이드)
+9. [팀원 소개](#-팀원-소개)
+
+---
+
+## 📝 프로젝트 개요
+
+- **목적**: 연속 공정(용탕→사출/충전→응고)의 **실시간/준실시간 데이터**를 표준화해 **현장 운영자·품질(QC)·데이터/AI팀**에게 **역할별 대시보드**로 제공. **이상 탐지·불량 예측·관리도(ARIMA-잔차 포함)·Cp/Cpk**을 **한 화면**에서 통합 관리.
+- **핵심 특징**
+
+  - 금형별(`mold_code`) **개별 예측 모델**(미등록 금형은 **소프트보팅**으로 평균 확률 산출)
+  - **임계치 + 모델 알림** 이중 경보, **Nelson Rules** 자동 검증
+  - **ARIMA 잔차 기반 관리도** + **Shewhart(X̄–R/S, P/NP)** + **Cp/Cpk** 산출
+  - **Isolation Forest** 이상 탐지, **SHAP/PDP**로 즉시 설명(XAI)
+
+- **기대효과**
+
+  - **초기·후기 취약구간** 선제 대응으로 불량률 저감
+  - 금형별 최적 레시피/조건 재현 → **품질 안정화**
+  - XAI로 **원인→조치** 연결 시간 단축
+
+---
+
+## 📂 주요 데이터 컬럼
+
+| 공정 단계      | 주요 컬럼                                                                                                 | Shiny 입력 예시           | 핵심 포인트                       |
+| -------------- | --------------------------------------------------------------------------------------------------------- | ------------------------- | --------------------------------- |
+| 용탕 준비·가열 | `molten_temp`, `molten_volume`                                                                            | `ui.input_slider(...)`    | 저온/부족 용탕 시 불량↑           |
+| 슬러리/워밍업  | `sleeve_temperature`, `EMS_operation_time`                                                                | `slider`, `select`        | 초기 안정성 영향                  |
+| 사출·충전      | `cast_pressure`, `low_section_speed`, `high_section_speed`, `physical_strength`, `biscuit_thickness`      | `slider`                  | 압력·속도·형체력·두께가 결함 좌우 |
+| 응고·냉각      | `upper_mold_temp1/2`, `lower_mold_temp1/2`, `Coolant_temperature`                                         | `slider`                  | 응고 균일성                       |
+| 메타/상태      | `mold_code`, `working`, `count`, `facility_operation_cycleTime`, `production_cycletime`, `tryshot_signal` | `select/numeric/checkbox` | 리셋·트라이샷 반영                |
+
+> _비고_: 1차 프로젝트의 변수 보정 규칙(상수/중복/결측/이상치) 승계 + 스트리밍 환경에서 **rolling fill + winsorization** 추가.
+
+---
+
+## 🔍 데이터 분석·전처리
+
+- **데이터 요약**: 2019-01-02 ~ 2019-03-12, 73,612행 / 타깃 `passorfail` (0=양품, 1=불량, **불균형 ~4–5%**)
+- **EDA 하이라이트**
+
+  - `molten_volume`↔`molten_temp` **음의 상관**, 상/하형 온도 **양의 상관**
+  - **압력-두께 조합**: `cast_pressure` < 150 → 불량률 급증 / `cast_pressure` ≥ 300 & `biscuit_thickness` 40–60 → 양품 집중
+  - **Count 패턴**: **초기(1~6)**, **후기(330~334)** 불량↑ (중간 구간 안정)
+
+- **전처리 원칙(배치/스트리밍 공통)**
+
+  - 센서 오류 제거(불가능 값, 스파이크 65535 등)
+  - 결측 대치(금형별 통계/보간, `tryshot_signal` 보정)
+  - 상태 정합(`working` 비정상·라벨 불일치 수정)
+  - 상수/결측 과다 컬럼 제거, 파생(`Count_stage`, EMS 시간대 범주화)
+  - 결과: **핵심 21변수**로 축약
+
+---
+
+## 🧠 모델링·품질관리 로직
+
+### 1) 불량 예측(분류)
+
+- **모델군**: RandomForest(**최종**), XGBoost, LightGBM
+- **불균형 처리**: MajorityVoteSMOTENC (범주형 투표 + 수치형 보간), 진성불량(`realfail`) 중심 증강
+- **파이프라인**: `OHE + RobustScaler` → **BayesSearchCV** 최적화
+- **검증**: **금형별 분할** + **시계열 보존(80:20)**, `TimeSeriesSplit(n_splits=5)`
+- **임계값**: 금형별 운영상 **0.5 통일**
+- **미등록 금형**: 5개 금형 모델 **소프트보팅(확률 평균)**으로 예측
+
+### 2) 이상 탐지(Isolation Forest)
+
+- **스케일/PCA 미적용**이 현 데이터에서 성능 우수 → **미적용 채택**
+- 금형별 contamination 탐색 후 `(-1:이상, 1:정상)` 매핑
+
+### 3) 관리도 & 규칙
+
+- **ARIMA-잔차 관리도**: 금형×변수별 ARIMA의 **잔차**로 관리도 구성
+
+  - `UCL/LCL`: **±3σ**(잔차 표준편차)
+  - 동특성·계절성 제거 후 **예측 오차 기반 이상 감지**
+
+- **Shewhart 관리도**: X̄–R/S(연속값), P/NP(이항)
+- **Nelson Rules**: 1, 2, 3, 5 규칙 위반 시 경보
+- **공정능력(Cp/Cpk)**
+
+  - `Cp = (USL - LSL) / (6σ)`
+  - `Cpk = min((USL - μ)/(3σ), (μ - LSL)/(3σ))`
+  - **표본 크기 보정** 및 **winsorization 옵션** 제공
+
+---
+
+## 📊 대시보드 기능(역할별)
+
+- **현장 운영자(Ops)**: 1초 스파크라인, 라인 상태판(OEE), **임계치+모델** 이중 알림, 이벤트 로그
+- **품질(QC)**: **ARIMA-잔차 / X̄–R/S / P-NP 관리도**, **Nelson Rules**, **Cp/Cpk**, 상관 히트맵, 주/월 리포트 다운로드
+- **데이터/AI**: 금형별 학습·평가(시계열 검증), 실시간 성능판(Acc/Prec/Rec/F1), **SHAP Force Plot / PDP**, 버전·성능 로그
+
+---
+
+## 🛠 사용 기술
+
+- **언어**: Python 3.11
+- **분석/ML**: `scikit-learn`, `imbalanced-learn`, `xgboost`, `lightgbm`, `shap`, `scipy`, `statsmodels`
+- **데이터/시각화**: `pandas`, `numpy`, `matplotlib`, `seaborn`, `plotly`
+- **웹 대시보드**: **Shiny for Python** (`shiny`, `shinywidgets`)
+- **기타**: `joblib`, `pyyaml`, `tqdm`
+
+---
+
+## 📁 프로젝트 구조
+
+```plaintext
+📦 diecasting-project
+ ┣ 📂 data/                 # 원본/전처리/스냅샷
+ ┣ 📂 models/               # 학습 모델, ARIMA, explainer, 로그
+ ┣ 📂 modules/              # Shiny 모듈(Ops/QC/AI/Utils/Ingress)
+ ┣ 📂 viz/                  # 관리도/스파크라인/SHAP/히트맵
+ ┣ 📂 www/                  # CSS/폰트/아이콘 (NotoSansKR 기본, Nanum 대체)
+ ┗ 📂 docs/                 # 리포트/그림/배포 기록(선택)
+```
+
+> **modules/** 하위 폴더 권장 구조
+>
+> - `ops/` : 실시간/알림/OEE/이벤트 로그
+> - `qc/` : Cp/Cpk, 관리도(ARIMA-잔차, X̄–R/S, P/NP), 상관 히트맵, 리포트
+> - `ai/` : 학습·평가·XAI(SHAP/PDP), 버전/성능 로그
+> - `utils/` : 전처리·임계·캐시·공통 위젯
+> - `ingress/` : 실시간 수집(mock/연동)
+
+---
+
+## 🏁 결론 및 운영 가이드
+
+- **핵심 발견**
+
+  - 취약구간: **Count 초반(1–6)**, **후반(330–334)**, **저온 영역**에서 불량 집중
+  - 공정조건: **압력 < 150** 위험 / **압력 ≥ 300 & 두께 40–60** 안정
+  - 금형 이질성: 금형별 패턴 상이 → **금형별 모델·레시피** 효과적
+
+- **운영 권고**
+
+  1. **이중 알림**(임계+모델) 동시 충족 시 **High Priority** 즉시 점검
+  2. **조정 순서**: Nelson 위반 원인 → **SHAP 상위 변수**(압력·온도·형체력·두께) 순으로 보정
+  3. **목표**: 불량확률 **< 30%** 유지, **Recall(F2)** 우선
+
+---

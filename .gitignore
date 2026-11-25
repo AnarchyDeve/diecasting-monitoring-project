@@ -1,0 +1,9 @@
+# ===========================
+# Python / Data Science Project Ignore
+# ===========================
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
